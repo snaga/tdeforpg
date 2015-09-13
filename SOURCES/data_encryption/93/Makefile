@@ -1,34 +1,20 @@
+# contrib/data_encryption/Makefile
 
-INSTDIR = /usr/local/pgsql/lib
-
-PGSQL_SRC_PATH ?= /usr/local/src/postgresql-9.3.6
-PGSQL_INCLUDE_PATH ?= $(PGSQL_SRC_PATH)/src/include
-PGSQL_LIBRARY_PATH ?= $(PGSQL_SRC_PATH)/contrib/pgcrypto
-export PGSQL_SRC_PATH
-export PGSQL_INCLUDE_PATH
-export PGSQL_LIBRARY_PATH
-
-BINARY = data_encryption.so
+MODULE_big = data_encryption
 OBJS = data_encryption.o
 
-CC = /usr/bin/gcc
-ifeq ($(debug),yes)
-  CFLAGS = -c -Wall -O0 -ggdb $(DEBUG) -fPIC
+EXTENSION = data_encryption
+DATA = data_encryption--1.1.sql
+
+SHLIB_LINK = $(shell $(PG_CONFIG) --libdir)/pgcrypto.so
+
+ifdef USE_PGXS
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
 else
-  CFLAGS = -c -Wall -O3 -fPIC
+subdir = contrib/data_encryption
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
 endif
-
-LFLAGS = -L$(PGSQL_LIBRARY_PATH)
-LINKER = -lpgcrypto -Wl,-rpath,'$(PGSQL_LIBRARY_PATH)'
-IFLAGS = -I$(PGSQL_INCLUDE_PATH) -I$(PGSQL_LIBRARY_PATH)
-
-all: $(BINARY)
-
-$(BINARY): $(OBJS)
-	$(CC) -shared -o $(BINARY) $(OBJS) $(LFLAGS) $(LINKER)
-
-%.o: %.c
-	$(CC) $(CFLAGS) $(IFLAGS) $<
-
-clean: 
-	rm -f $(BINARY) $(OBJS)
