@@ -65,6 +65,11 @@ key_info *newest_key_info = NULL;
 key_info *old_key_info = NULL;
 const short header = 1;
 
+key_info* create_key_info(text* key, text* algorithm);
+bool drop_key_info(key_info* entry);
+void _PG_init(void);
+void _PG_fini(void);
+
 void
 _PG_init(void)
 {
@@ -620,7 +625,7 @@ enc_store_old_key_info(PG_FUNCTION_ARGS)
  */
 PG_FUNCTION_INFO_V1(enc_drop_key_info);
 Datum
-enc_drop_key_info(void)
+enc_drop_key_info(PG_FUNCTION_ARGS)
 {
 	if(drop_key_info(newest_key_info)){
 		newest_key_info = NULL;
@@ -639,7 +644,7 @@ enc_drop_key_info(void)
 PG_FUNCTION_INFO_V1(enc_drop_old_key_info);
 
 Datum
-enc_drop_old_key_info(void)
+enc_drop_old_key_info(PG_FUNCTION_ARGS)
 {
 	if(drop_key_info(old_key_info)){
 		old_key_info = NULL;
@@ -702,7 +707,7 @@ enc_rename_backupfile(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(enc_save_logsetting);
 
 Datum
-enc_save_logsetting(void)
+enc_save_logsetting(PG_FUNCTION_ARGS)
 {
 	/* if backup of current parameters are not exist */
 	if(save_log_statement == -1 && save_log_min_error_statement == -1 &&
