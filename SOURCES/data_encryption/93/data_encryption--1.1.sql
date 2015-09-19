@@ -349,6 +349,7 @@ SET check_function_bodies TO off;
 --	DROP TABLE IF EXISTS cipher_key_table;
 	CREATE TABLE cipher_key_table (key BYTEA
 								, algorithm TEXT);
+	REVOKE ALL ON TABLE cipher_key_table FROM PUBLIC;
 
 --
 -- cipher_key_function.sql
@@ -437,6 +438,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+REVOKE ALL ON FUNCTION cipher_key_regist(TEXT, TEXT, TEXT) FROM PUBLIC;
 
 /*------------------------------------------------------------*
  * Function : cipher_key_reencrypt_data
@@ -558,6 +560,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+REVOKE ALL ON FUNCTION cipher_key_reencrypt_data(TEXT, TEXT, TEXT) FROM PUBLIC;
 
 /*------------------------------------------------------------*
  * Function : cipher_key_backup
@@ -613,6 +616,7 @@ END;
 $$ LANGUAGE plpgsql
 SET search_path TO public;
 
+REVOKE ALL ON FUNCTION cipher_key_backup() FROM PUBLIC;
 
 /*------------------------------------------------------------*
  * Function : cipher_key_disable_log
@@ -639,6 +643,7 @@ END;
 $$ LANGUAGE plpgsql
 SET search_path TO public;
 
+REVOKE ALL ON FUNCTION cipher_key_disable_log() FROM PUBLIC;
 
 /*------------------------------------------------------------*
  * Function : cipher_key_enable_log
@@ -663,6 +668,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql
 SET search_path TO public;
+
+REVOKE ALL ON FUNCTION cipher_key_enable_log() FROM PUBLIC;
 
 --
 -- common_session_create.sql
@@ -731,6 +738,7 @@ END;
 $$ LANGUAGE plpgsql
 SET search_path TO public;
 
+REVOKE ALL ON FUNCTION pgtde_begin_session(TEXT) FROM PUBLIC;
 
 /*------------------------------------------------------------*
  * Function : pgtde_end_session
@@ -752,3 +760,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql
 SET search_path TO public;
+
+REVOKE ALL ON FUNCTION pgtde_end_session() FROM PUBLIC;
