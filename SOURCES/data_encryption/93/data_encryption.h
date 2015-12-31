@@ -21,6 +21,12 @@
 
 /* structure for maintain encryption key information */
 typedef struct {
-	char           *key;          /* encryption key */
-	char           *algorithm;    /* encryption algorithm */
+	bytea           *key;          /* encryption key */
+	text           *algorithm;    /* encryption algorithm */
 }key_info;
+
+bytea* pgtde_encrypt(bytea* input_data);
+Datum pgtde_decrypt(key_info* entry, bytea* encrypted_data);
+bytea* add_header_to_result(bytea* encrypted_data);
+bytea* remove_header_from_inputdata(bytea* input_data);
+bool cmp_binary(bytea* barg1, bytea* barg2);
