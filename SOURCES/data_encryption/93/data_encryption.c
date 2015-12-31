@@ -21,6 +21,7 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "pgstat.h"
 #include "utils/guc.h"
 #include "utils/palloc.h"
 #include "utils/builtins.h"
@@ -31,6 +32,7 @@
 #include "access/hash.h"
 #include "libpq/pqformat.h"
 #include "utils/memutils.h"
+#include "catalog/pg_collation.h"
 
 #include "pgcrypto.h"
 #include "px.h"
@@ -44,14 +46,11 @@ PG_MODULE_MAGIC;
 /* enable encryption/decryption function */
 static bool encrypt_enable = true;
 
-/* checking log_statement is 'all' or not */
-static bool encrypt_checklogparam = true;
-
 /* backup of encryption key */
 static char *encrypt_backup = "";
 
-/* backup of log_statement value */
-int save_log_statement = -1;
+/* whether mask pgtde_begin_session query log or not */
+static bool encrypt_mask_cipherkeylog = false;
 
 /* backup of log_min_error_statement value*/
 int save_log_min_error_statement = -1;
@@ -65,31 +64,45 @@ key_info *newest_key_info = NULL;
 key_info *old_key_info = NULL;
 const short header = 1;
 
-key_info* create_key_info(text* key, text* algorithm);
-bool drop_key_info(key_info* entry);
+/* mask log messages */
+static void suppress_cipherkeylog_hook(ErrorData *);
+
+/* backup the old one */
+static emit_log_hook_type prev_emit_log_hook = NULL;
+
+/* protect from recursive call */
+static bool being_hook = false;
+
 void _PG_init(void);
 void _PG_fini(void);
+key_info* create_key_info(text* key, text* algorithm);
+bool drop_key_info(key_info* entry);
+bool is_session_opened(void);
 
 void
 _PG_init(void)
 {
+	/* load hook module */
+	prev_emit_log_hook = emit_log_hook;
+	emit_log_hook = suppress_cipherkeylog_hook;
+
+	DefineCustomBoolVariable("encrypt.mask_cipherkeylog",
+			"mask query log messages, string within () mark will be masked by *****",
+			NULL,
+			&encrypt_mask_cipherkeylog,
+			false,
+			PGC_SUSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
 	DefineCustomBoolVariable("encrypt.enable",
 			"encryption on/off.",
 			NULL,
 			&encrypt_enable,
 			true,
 			PGC_USERSET,
-			0,
-			NULL,
-			NULL,
-			NULL);
-
-	DefineCustomBoolVariable("encrypt.checklogparam",
-			"log_statement check on/off.",
-			NULL,
-			&encrypt_checklogparam,
-			true,
-			PGC_SUSET,
 			0,
 			NULL,
 			NULL,
@@ -110,9 +123,204 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
-
+	/* restore emit_log_hook when unload */
+	if (emit_log_hook == suppress_cipherkeylog_hook){
+		emit_log_hook = prev_emit_log_hook;
+	}
 }
 
+/* mask cipherkeylog hook */
+/*
+ * Function : suppress_cipherkeylog_hook
+ * ---------------------
+ * Mask query log messages.
+ * String in "()" mark will be quoted by *****.
+ *
+ * @param	*char ARG[0]		input ErrorData*
+ * @return	nothing
+ */
+static void
+suppress_cipherkeylog_hook(ErrorData *edata){
+	/*
+	 * These temporary variables below are allocated in ErrorContext.
+	 * PostgreSQL do not reset ErrorContext when elevel is not in
+	 * ERROR, FATAL, PANIC. So we must pfree in this case.
+	 */
+	Datum convertedMsg, replaceMsg_tmp, regex, regex_param, mask, flag;
+	MemoryContext old_mem_context;
+
+	/* call the old one if exist */
+	if (prev_emit_log_hook){
+		prev_emit_log_hook(edata);
+	}
+
+	if(encrypt_mask_cipherkeylog && !(being_hook)){
+		/* Arguments of textregexreplace.*/
+		regex = CStringGetTextDatum("[(].+[)]"),
+		mask  = CStringGetTextDatum("(*****)"),
+		flag  = CStringGetTextDatum("g");
+
+		/* protect from recursive call */
+		being_hook = true;
+		/* mask STATEMENT error messages */
+		if(debug_query_string){
+			replaceMsg_tmp = CStringGetTextDatum(debug_query_string);
+			convertedMsg = DirectFunctionCall4Coll(textregexreplace,
+					C_COLLATION_OID,
+					replaceMsg_tmp,
+					regex,
+					mask,
+					flag);
+			if(replaceMsg_tmp){
+				px_memset((void*)replaceMsg_tmp,0,sizeof(replaceMsg_tmp));
+				pfree((void*)replaceMsg_tmp);
+			}
+			old_mem_context = MemoryContextSwitchTo(MessageContext);
+			debug_query_string = TextDatumGetCString(convertedMsg);
+			MemoryContextSwitchTo(old_mem_context);
+			if(convertedMsg){
+				pfree((void*)convertedMsg);
+			}
+		}
+
+		/* mask normal log messages */
+		if(edata->message){
+			replaceMsg_tmp = CStringGetTextDatum(edata->message);
+			convertedMsg = DirectFunctionCall4Coll(textregexreplace,
+					C_COLLATION_OID,
+					replaceMsg_tmp,
+					regex,
+					mask,
+					flag);
+			if(replaceMsg_tmp){
+				px_memset((void*)replaceMsg_tmp,0,sizeof(replaceMsg_tmp));
+				pfree((void*)replaceMsg_tmp);
+			}
+			/* do not leave anything relate to key info in memory*/
+			px_memset(edata->message,0,sizeof(edata->message));
+			pfree(edata->message);
+			edata->message = TextDatumGetCString(convertedMsg);
+			if(convertedMsg){
+				pfree((void*)convertedMsg);
+			}
+		}
+
+		/* mask DETAIL error message
+		 * edata->detail_log never include any query message.
+		 * so we just mask only edata->detail.
+		 */
+		if(edata->detail){
+			replaceMsg_tmp = CStringGetTextDatum(edata->detail);
+			convertedMsg = DirectFunctionCall4Coll(textregexreplace,
+					C_COLLATION_OID,
+					replaceMsg_tmp,
+					regex,
+					mask,
+					flag);
+			if(replaceMsg_tmp){
+				px_memset((void*)replaceMsg_tmp,0,sizeof(replaceMsg_tmp));
+				pfree((void*)replaceMsg_tmp);
+			}
+			/* The following must be execute only in extension protocol.
+			* But can not judge whether extension protocol or not */
+			regex_param = CStringGetTextDatum("parameters: .+");
+			replaceMsg_tmp = DirectFunctionCall4Coll(textregexreplace,
+				C_COLLATION_OID,
+				convertedMsg,
+				regex_param,
+				mask,
+				flag);
+			if(convertedMsg){
+				px_memset((void*)convertedMsg,0,sizeof(convertedMsg));
+				pfree((void*)convertedMsg);
+			}
+			if(regex_param){
+				pfree((void*)regex_param);
+			}
+			/* do not leave anything relate to key info in memory*/
+			px_memset(edata->detail,0,sizeof(edata->detail));
+			pfree(edata->detail);
+			edata->detail = TextDatumGetCString(replaceMsg_tmp);
+			if(replaceMsg_tmp){
+				pfree((void*)replaceMsg_tmp);
+			}
+		}
+
+		/* QUERY error message
+		 * if a sql in function failed, then the query is printed as QUERY message.
+		 */
+		if(edata->internalquery){
+			replaceMsg_tmp = CStringGetTextDatum(edata->internalquery);
+			convertedMsg = DirectFunctionCall4Coll(textregexreplace,
+				C_COLLATION_OID,
+				replaceMsg_tmp,
+				regex,
+				mask,
+				flag);
+			if(replaceMsg_tmp){
+				px_memset((void*)replaceMsg_tmp,0,sizeof(replaceMsg_tmp));
+				pfree((void*)replaceMsg_tmp);
+			}
+			/* do not leave anything relate to key info in memory*/
+			px_memset(edata->internalquery,0,sizeof(edata->internalquery));
+			pfree(edata->internalquery);
+			edata->internalquery = TextDatumGetCString(convertedMsg);
+			if(convertedMsg){
+				pfree((void*)convertedMsg);
+			}
+		}
+
+		/* QUERY context message
+		 * cipher key is included in edata->context messages. So it must be masked
+		 */
+		if(edata->context){
+			replaceMsg_tmp = CStringGetTextDatum(edata->context);
+				convertedMsg = DirectFunctionCall4Coll(textregexreplace,
+				C_COLLATION_OID,
+				replaceMsg_tmp,
+				regex,
+				mask,
+				flag);
+			if(replaceMsg_tmp){
+				px_memset((void*)replaceMsg_tmp,0,sizeof(replaceMsg_tmp));
+				pfree((void*)replaceMsg_tmp);
+			}
+			/* do not leave anything relate to key info in memory*/
+			px_memset(edata->context,0,sizeof(edata->context));
+			pfree(edata->context);
+			edata->context = TextDatumGetCString(convertedMsg);
+			if(convertedMsg){
+				pfree((void*)convertedMsg);
+			}
+		}
+		if(regex)
+			pfree((void*)regex);
+		if(mask)
+			pfree((void*)mask);
+		if(flag)
+			pfree((void*)flag);
+		/* protect from recursive call */
+		being_hook = false;
+	}
+}
+
+/*
+ * Function : mask_activity
+ * ---------------------
+ * masked pg_stat_activity's query column to specify text.
+ *
+ * @param	nothing
+ * @return	nothing
+ */
+PG_FUNCTION_INFO_V1(mask_activity);
+Datum
+mask_activity(PG_FUNCTION_ARGS)
+{
+	elog(DEBUG2,"TDE-D0002 masking pg_stat_activity's query.");
+	pgstat_report_activity(STATE_RUNNING,"<query masking...>");
+
+	PG_RETURN_VOID();
+}
 
 /*
  * Function : enctext_in
@@ -128,44 +336,18 @@ Datum
 enctext_in(PG_FUNCTION_ARGS)
 {
 	char     *input_text = PG_GETARG_CSTRING(0);    /* input plain text parameter */
-
 	bytea    *encrypted_data = NULL; /* encryption data */
 	bytea    *result = NULL;         /* header + encyrpted_data  */
-	bytea    *tmp_data = NULL;
-	bytea    *tmp_key = NULL;
-	text     *tmp_algorithm = NULL;
+	bytea    *plain_data = NULL;
 
 	/* if encrypt_enable is true, encrypting plain text and return */
 	if (encrypt_enable) {
-		/* if key is not set print error and exit */
-		if (newest_key_info == NULL) {
-			ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				errmsg("TDE-E0016 could not encrypt data, because key was not set(01)")));
-		}
-
-		/* get key and encryption algorithm and encrypt data */
-		tmp_data = (bytea *) DatumGetPointer(DirectFunctionCall1(textin, CStringGetDatum(input_text)));
-		tmp_key = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(newest_key_info->key)));
-		tmp_algorithm = cstring_to_text(newest_key_info->algorithm);
-		encrypted_data = (bytea *)
-						DatumGetPointer(DirectFunctionCall3(pg_encrypt,
-							PointerGetDatum(tmp_data),
-							PointerGetDatum(tmp_key),
-							PointerGetDatum(tmp_algorithm)));
-
-		pfree(tmp_data);
-		/* do not leave anything relate to key info in memory*/
-		px_memset(VARDATA_ANY(tmp_key), 0, VARSIZE_ANY_EXHDR(tmp_key));
-		pfree(tmp_key);
-		pfree(tmp_algorithm);
+		plain_data = (bytea *) DatumGetPointer(DirectFunctionCall1(textin, CStringGetDatum(input_text)));
+		encrypted_data = pgtde_encrypt(plain_data);
+		pfree(plain_data);
 
 		/* add header(dummy) to encrypted data */
-		result = (bytea *) palloc(VARSIZE(encrypted_data) + sizeof(short));
-		SET_VARSIZE(result, VARSIZE(encrypted_data) + sizeof(short));
-		memcpy(VARDATA(result), &header, sizeof(short));
-		memcpy((VARDATA(result) + sizeof(short)), VARDATA_ANY(encrypted_data), VARSIZE_ANY_EXHDR(encrypted_data));
-
+		result = add_header_to_result(encrypted_data);
 		pfree(encrypted_data);
 
 		PG_RETURN_BYTEA_P(result);
@@ -190,24 +372,14 @@ PG_FUNCTION_INFO_V1(enctext_out);
 Datum
 enctext_out(PG_FUNCTION_ARGS)
 {
-	bytea *vlena = PG_GETARG_BYTEA_PP(0); /* pointer of input ciphertext  */
-
+	bytea *input_data = PG_GETARG_BYTEA_PP(0); /* pointer of input ciphertext  */
 	bytea *encrypted_data = NULL;  /* remove header of ciphertext */
 	key_info *entry = NULL;           /* key */
 	Datum result;
 	Datum tmp_result;
-	bytea *tmp_key = NULL;
-	text *tmp_algorithm = NULL;
 
 	/* if encrypt_enable is true, decrypt input data and return */
 	if (encrypt_enable) {
-		/* if key is not set print error and exit */
-		if (newest_key_info == NULL) {
-			ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				errmsg("TDE-E0017 could not decrypt data, because key was not set(01)")));
-		}
-
 		/* if old key is exists, re-encryption is working now */
 		if (old_key_info != NULL) {
 			entry = old_key_info;
@@ -216,32 +388,20 @@ enctext_out(PG_FUNCTION_ARGS)
 		}
 
 		/* remove header from input data */
-		encrypted_data = (bytea *)palloc(VARSIZE_ANY_EXHDR(vlena) - sizeof(short) + VARHDRSZ);
-		SET_VARSIZE(encrypted_data, VARSIZE_ANY_EXHDR(vlena) - sizeof(short) + VARHDRSZ);
-		memcpy(VARDATA(encrypted_data), (VARDATA_ANY(vlena) + sizeof(short)), VARSIZE_ANY_EXHDR(vlena) - sizeof(short));
-
+		encrypted_data = remove_header_from_inputdata(input_data);
 		/* decrypting ciphertext */
-		tmp_key = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(entry->key)));
-		tmp_algorithm = cstring_to_text(entry->algorithm);
-		tmp_result = DirectFunctionCall3(pg_decrypt,
-										PointerGetDatum(encrypted_data),
-										PointerGetDatum(tmp_key),
-										PointerGetDatum(tmp_algorithm));
+		tmp_result = pgtde_decrypt(entry, encrypted_data);
 		result = DirectFunctionCall1(textout, tmp_result);
 
 		pfree(encrypted_data);
 		pfree(DatumGetPointer(tmp_result));
-		/* do not leave anything relate to key info in memory*/
-		px_memset(VARDATA_ANY(tmp_key), 0, VARSIZE_ANY_EXHDR(tmp_key));
-		pfree(tmp_key);
-		pfree(tmp_algorithm);
 	}
 	/* if encrypt_enable is false return ciphertext */
 	else {
-		result = DirectFunctionCall1(byteaout, PointerGetDatum(vlena));
+		result = DirectFunctionCall1(byteaout, PointerGetDatum(input_data));
 	}
 
-	PG_FREE_IF_COPY(vlena, 0);
+	PG_FREE_IF_COPY(input_data, 0);
 
 	PG_RETURN_DATUM(result);
 }
@@ -261,46 +421,19 @@ Datum
 encbytea_in(PG_FUNCTION_ARGS)
 {
 	char     *input_text = PG_GETARG_CSTRING(0);  /* input plain text parameter */
-
 	bytea    *encrypted_data = NULL; /* encryption data */
 	bytea    *result = NULL;         /* header + encrypted_data */
-	bytea    *tmp_data = NULL;
-	bytea    *tmp_key = NULL;
-	text     *tmp_algorithm = NULL;
+	bytea    *plain_data = NULL;
 
 	/* if encrypt_enable is true, encrypting plain text and return */
 	if (encrypt_enable) {
-		/* if key is not set print error and exit */
-		if (newest_key_info == NULL) {
-			ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				errmsg("TDE-E0016 could not encrypt data, because key was not set(02)")));
-		}
-
 		/* get key and encryption algorithm and encrypt data */
-		tmp_data = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(input_text)));
-		tmp_key = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(newest_key_info->key)));
-		tmp_algorithm = cstring_to_text(newest_key_info->algorithm);
-		encrypted_data = (bytea *)
-						DatumGetPointer(DirectFunctionCall3(pg_encrypt,
-							PointerGetDatum(tmp_data),
-							PointerGetDatum(tmp_key),
-							PointerGetDatum(tmp_algorithm)));
-
-		pfree(tmp_data);
-		/* do not leave anything relate to key info in memory*/
-		px_memset(VARDATA_ANY(tmp_key), 0, VARSIZE_ANY_EXHDR(tmp_key));
-		pfree(tmp_key);
-		pfree(tmp_algorithm);
-
+		plain_data = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(input_text)));
+		encrypted_data = pgtde_encrypt(plain_data);
+		pfree(plain_data);
 		/* add header information to encrypted data */
-		result = (bytea *) palloc(VARSIZE(encrypted_data) + sizeof(short));
-		SET_VARSIZE(result, VARSIZE(encrypted_data) + sizeof(short));
-		memcpy(VARDATA(result), &header, sizeof(short));
-		memcpy((VARDATA(result) + sizeof(short)), VARDATA_ANY(encrypted_data), VARSIZE_ANY_EXHDR(encrypted_data));
-
+		result = add_header_to_result(encrypted_data);
 		pfree(encrypted_data);
-
 		PG_RETURN_BYTEA_P(result);
 	}
 	/* if encrypt_enable is not true return plain text */
@@ -323,24 +456,16 @@ PG_FUNCTION_INFO_V1(encbytea_out);
 Datum
 encbytea_out(PG_FUNCTION_ARGS)
 {
-	bytea *vlena = PG_GETARG_BYTEA_PP(0); /* pointer of input ciphertext  */
+	bytea *input_data = PG_GETARG_BYTEA_PP(0); /* pointer of input ciphertext  */
 
 	bytea *encrypted_data = NULL;  /* remove header of ciphertext */
 	key_info *entry = NULL;           /* key */
 	Datum result;
 	Datum tmp_result;
-	bytea *tmp_key = NULL;
-	text *tmp_algorithm = NULL;
 
 	/* if encrypt_enable is true, decrypt input data and return */
 	if (encrypt_enable) {
 		/* if key is not set print error and exit */
-		if (newest_key_info == NULL) {
-			ereport(ERROR,
-				(errcode(ERRCODE_IO_ERROR),
-				errmsg("TDE-E0017 could not decrypt data, because key was not set(02)")));
-		}
-
 		if (old_key_info != NULL) {
 			entry = old_key_info;
 		} else {
@@ -348,36 +473,23 @@ encbytea_out(PG_FUNCTION_ARGS)
 		}
 
 		/* remove header information from input data */
-		encrypted_data = (bytea *)palloc(VARSIZE_ANY_EXHDR(vlena) - sizeof(short) + VARHDRSZ);
-		SET_VARSIZE(encrypted_data, VARSIZE_ANY_EXHDR(vlena) - sizeof(short) + VARHDRSZ);
-		memcpy(VARDATA(encrypted_data), (VARDATA_ANY(vlena) + sizeof(short)), VARSIZE_ANY_EXHDR(vlena) - sizeof(short));
+		encrypted_data = remove_header_from_inputdata(input_data);
 
 		/* decrypting ciphertext */
-		tmp_key = (bytea *) DatumGetPointer(DirectFunctionCall1(byteain, CStringGetDatum(entry->key)));
-		tmp_algorithm = cstring_to_text(entry->algorithm);
-		tmp_result = DirectFunctionCall3(pg_decrypt, 
-										PointerGetDatum(encrypted_data),
-										PointerGetDatum(tmp_key),
-										PointerGetDatum(tmp_algorithm));
+		tmp_result = pgtde_decrypt(entry, encrypted_data);
 		result = DirectFunctionCall1(byteaout, tmp_result);
 
 		pfree(encrypted_data);
 		pfree(DatumGetPointer(tmp_result));
-		/* do not leave anything relate to key info in memory*/
-		px_memset(VARDATA_ANY(tmp_key), 0, VARSIZE_ANY_EXHDR(tmp_key));
-		pfree(tmp_key);
-		pfree(tmp_algorithm);
 	}
 	/* if encrypt_enable is false return ciphertext */
 	else {
-		result = DirectFunctionCall1(byteaout, PointerGetDatum(vlena));
+		result = DirectFunctionCall1(byteaout, PointerGetDatum(input_data));
 	}
 
-	PG_FREE_IF_COPY(vlena, 0);
-
+	PG_FREE_IF_COPY(input_data, 0);
 	PG_RETURN_DATUM(result);
 }
-
 
 /*
  * Function : enc_compeq_enctext
@@ -393,32 +505,14 @@ PG_FUNCTION_INFO_V1(enc_compeq_enctext);
 Datum
 enc_compeq_enctext(PG_FUNCTION_ARGS)
 {
-	bytea *barg1  = NULL;
-	bytea *barg2  = NULL;
-
-	int len1 = 0;
-	int len2 = 0;
-	bool result = true;
-
-	barg1 = PG_GETARG_BYTEA_PP(0);
-	barg2 = PG_GETARG_BYTEA_PP(1);
-
-	len1 = VARSIZE_ANY_EXHDR(barg1);
-	len2 = VARSIZE_ANY_EXHDR(barg2);
-	/* return false, if length of barg1 and barg2 are different */
-	if (len1 != len2) {
-		result  = false;
-	}
-	else {
-		result = (memcmp(VARDATA_ANY(barg1), VARDATA_ANY(barg2), len1) == 0);
-	}
-
+	bytea *barg1  = PG_GETARG_BYTEA_PP(0);
+	bytea *barg2  = PG_GETARG_BYTEA_PP(1);
+	bool result = cmp_binary(barg1, barg2);
 	PG_FREE_IF_COPY(barg1, 0);
 	PG_FREE_IF_COPY(barg2, 1);
 
 	PG_RETURN_BOOL(result);
 }
-
 
 /*
  * Function : enc_compeq_encbytea
@@ -434,26 +528,12 @@ PG_FUNCTION_INFO_V1(enc_compeq_encbytea);
 Datum
 enc_compeq_encbytea(PG_FUNCTION_ARGS)
 {
-	bytea *arg1  = PG_GETARG_BYTEA_PP(0);
-	bytea *arg2  = PG_GETARG_BYTEA_PP(1);
+	bytea *barg1  = PG_GETARG_BYTEA_PP(0);
+	bytea *barg2  = PG_GETARG_BYTEA_PP(1);
+	bool result = cmp_binary(barg1, barg2);
 
-	int len1 = 0;
-	int len2 = 0;
-	bool result = true;
-
-	len1 = VARSIZE_ANY_EXHDR(arg1);
-	len2 = VARSIZE_ANY_EXHDR(arg2);
-
-	/* return false, if length of barg1 and barg2 are different */
-	if (len1 != len2) {
-		result = false;
-	}
-	else {
-		result = (memcmp(VARDATA_ANY(arg1), VARDATA_ANY(arg2), len1) == 0);
-	}
-
-	PG_FREE_IF_COPY(arg1, 0);
-	PG_FREE_IF_COPY(arg2, 1);
+	PG_FREE_IF_COPY(barg1, 0);
+	PG_FREE_IF_COPY(barg2, 1);
 
 	PG_RETURN_BOOL(result);
 }
@@ -546,10 +626,13 @@ key_info* create_key_info(text* key, text* algorithm) {
 	/* cipher key must be stored in TopMemoryContext */
 	old_mem_context = MemoryContextSwitchTo(TopMemoryContext);
 	entry =(key_info*) palloc(sizeof(key_info));
-	/* caution text_to_cstring function using palloc internally
-	 * it must be free by pfree function */
-	entry->key       = (char*) text_to_cstring(key);
-	entry->algorithm = (char*) text_to_cstring(algorithm);
+
+	entry->key = (bytea *) palloc(VARSIZE(key));
+	memcpy((char *) entry->key, (char *) key, VARSIZE(key));
+
+	entry->algorithm = (text *) palloc(VARSIZE(algorithm));
+	memcpy((char *) entry->algorithm, (char *) algorithm, VARSIZE(algorithm));
+
 	MemoryContextSwitchTo(old_mem_context);
 
 	return entry;
@@ -696,74 +779,66 @@ enc_rename_backupfile(PG_FUNCTION_ARGS)
 
 }
 
-
-/*
- * Function : enc_save_logsetting
- * ---------------------
- * backup current parameters of log_statement, log_min_error_statement and log_min_duration_statement
- *
- * @return true if parameters are backuped successfully
- */
-PG_FUNCTION_INFO_V1(enc_save_logsetting);
-
-Datum
-enc_save_logsetting(PG_FUNCTION_ARGS)
-{
-	/* if backup of current parameters are not exist */
-	if(save_log_statement == -1 && save_log_min_error_statement == -1 &&
-		save_log_min_duration_statement == -1){
-		/* backup current parameters */
-		save_log_statement = log_statement;
-		save_log_min_error_statement = log_min_error_statement;
-		save_log_min_duration_statement = log_min_duration_statement;
-
-		/* setting parameters, "do not log details"  */
-		log_statement = LOGSTMT_NONE;
-		log_min_error_statement = PANIC;
-		log_min_duration_statement = -1;
+/* return true, if encryption key is set */
+bool
+is_session_opened(void) {
+	/* if key is not set return false */
+	if (newest_key_info == NULL) {
+		return false;
 	}
-	/* if parameters are already backuped */
-	else{
-		PG_RETURN_BOOL(FALSE);
-	}
-
-	PG_RETURN_BOOL(TRUE);
+	return true;
 }
 
 
-/*
- * Function : enc_restore_logsetting
- * ---------------------
- * restore log parameters from backup of parameters
- *
- * @return true if backup of parameters are exist
- */
-PG_FUNCTION_INFO_V1(enc_restore_logsetting);
-
-Datum
-enc_restore_logsetting(PG_FUNCTION_ARGS)
-{
-	/* return false, backcup of log parameters are not exist */
-	if(save_log_statement == -1 && save_log_min_error_statement == -1 &&
-		save_log_min_duration_statement == -1){
-		PG_RETURN_BOOL(FALSE);
+/* encrypt input_data using lastest key and return */
+bytea* pgtde_encrypt(bytea* input_data) {
+	bytea *encrypted_data;
+	if(!is_session_opened()){
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
+					errmsg("TDE-E0016 could not encrypt data, because key was not set[01]")));
 	}
-	else{
-		/* restore log parameters from backup of parameters */
-		log_statement = save_log_statement;
-		log_min_error_statement = save_log_min_error_statement;
-		log_min_duration_statement = save_log_min_duration_statement;
-
-		/* init backup of parameters */
-		save_log_statement = -1;
-		save_log_min_error_statement = -1;
-		save_log_min_duration_statement = -1;
-	}
-
-	PG_RETURN_BOOL(TRUE);
-
+	encrypted_data = (bytea *) DatumGetPointer(DirectFunctionCall3(pg_encrypt,
+				PointerGetDatum(input_data), PointerGetDatum(newest_key_info->key),
+				PointerGetDatum(newest_key_info->algorithm)));
+	return encrypted_data;
 }
 
+/* decrypt encrypted_data using entry and return */
+Datum pgtde_decrypt(key_info* entry, bytea* encrypted_data) {
+	Datum result;
+	if(!is_session_opened()){
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR),
+					errmsg("TDE-E0017 could not decrypt data, because key was not set[01]")));
+	}
+	result = DirectFunctionCall3(pg_decrypt, PointerGetDatum(encrypted_data),
+			PointerGetDatum(entry->key), PointerGetDatum(entry->algorithm));
+	return result;
+}
+
+/* add header to encrypted data */
+bytea* add_header_to_result(bytea* encrypted_data) {
+	bytea* result = NULL;
+	result = (bytea *) palloc(VARSIZE(encrypted_data) + sizeof(short));
+	/* add key header information to encrypted data */
+	SET_VARSIZE(result, VARSIZE(encrypted_data) + sizeof(short));
+	memcpy(VARDATA(result), &header, sizeof(short));
+	memcpy((VARDATA(result) + sizeof(short)), VARDATA_ANY(encrypted_data),
+			VARSIZE_ANY_EXHDR(encrypted_data));
+	return result;
+}
+
+/* remove header from input data */
+bytea* remove_header_from_inputdata(bytea* input_data) {
+	bytea* encrypted_data = NULL;
+	/* remove version from input data */
+	encrypted_data = (bytea *) palloc(
+			VARSIZE_ANY_EXHDR(input_data) - sizeof(short) + VARHDRSZ);
+	SET_VARSIZE(encrypted_data,
+			VARSIZE_ANY_EXHDR(input_data) - sizeof(short) + VARHDRSZ);
+	memcpy(VARDATA(encrypted_data), (VARDATA_ANY(input_data) + sizeof(short)),
+			VARSIZE_ANY_EXHDR(input_data) - sizeof(short));
+	return encrypted_data;
+}
 
 PG_FUNCTION_INFO_V1(encrecv);
 /*
@@ -797,4 +872,18 @@ encsend(PG_FUNCTION_ARGS)
 	bytea	   *vlena = PG_GETARG_BYTEA_P_COPY(0);
 
 	PG_RETURN_BYTEA_P(vlena);
+}
+
+/* return true , if barg1 and barg2 are equal */
+bool cmp_binary(bytea* barg1, bytea* barg2) {
+	int len1 = VARSIZE_ANY_EXHDR(barg1);
+	int len2 = VARSIZE_ANY_EXHDR(barg2);
+	bool result;
+	/* return false, if length of barg1 and barg2 are different */
+	if (len1 != len2) {
+		result = false;
+	} else {
+		result = (memcmp(VARDATA_ANY(barg1), VARDATA_ANY(barg2), len1) == 0);
+	}
+	return result;
 }

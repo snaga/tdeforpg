@@ -15,13 +15,13 @@ How to Upgrade from old version
 ===============================
 1. Setting environment variables
     $ export PGHOME = #path of PostgreSQL installed
-    $ export TDEHOME = #path of pgTDE downloaded
+    $ export TDEHOME = #path of tdeforpg downloaded
 
 2. Dump existing database using pg_dump
     $ PGOPTIONS="-c encrypt.enable=off" pg_dump -f <dump_file> -Fc <database>
     
 3. Make a restore list from dumpfile
-    $ pg_restore -l <> > <dumplist_file>
+    $ pg_restore -l <dump_file> > <dumplist_file>
     $ psql -F ' ' -d <database>  << EOF | grep -E [0-9]+ > <tdeoperator_list_file>
       \t
       \a
@@ -30,7 +30,7 @@ How to Upgrade from old version
                            JOIN pg_namespace c ON  c.oid=a.oprnamespace
       WHERE  a.oprcode in (select oid from pg_proc where probin like '%data_encryption.so');
       EOF
-    $ grep -v -f $TDEHOME/SOURCES/lib/upgrade/installed_list_fe_v1_0.txt -f <tdeoperator_list_file> <dumplist_file> > <restorelist_file>
+    $ grep -v -f $TDEHOME/SOURCES/lib/upgrade/installed_list_fe_<old_version>.txt -f <tdeoperator_list_file> <dumplist_file> > <restorelist_file>
 
 4. Uninstall old version of tdeforpg
     $ sh $TDEHOME/SOURCES/bin/cipher_setup.sh $PGHOME
@@ -55,7 +55,7 @@ How to Upgrade from old version
 7. Delete old shared object file
     $ sudo rm /usr/lib64/data_encryption.so
 
-8. Building and install new pgTDE to database
+8. Building and install new tdeforpg to database
     Please refer to the INSTALL-NOTE for more details.
 
 9. Restore database using pg_restore
